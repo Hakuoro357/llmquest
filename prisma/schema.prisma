@@ -1,0 +1,453 @@
+// LLM-TextQuest Prisma schema draft
+// Source of truth for shape: LLM-TextQuest-Data-Model-Spec.md
+//
+// Notes:
+// - This is a first implementation draft for MVP.
+// - Some constraints from the spec require SQL migrations outside Prisma schema:
+//   - partial unique index for one active session per character
+//   - partial unique / guarded lock semantics for PROCESSING_TURN
+//   - check constraints for stat ranges and HP consistency
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserPlan {
+  FREE
+  PREMIUM
+}
+
+enum SubscriptionStatus {
+  INACTIVE
+  ACTIVE
+  PAST_DUE
+  CANCELED
+  EXPIRED
+  INCOMPLETE
+}
+
+enum BillingProvider {
+  STRIPE
+}
+
+enum WorldVisibility {
+  PUBLIC
+  PRIVATE
+}
+
+enum WorldStatus {
+  DRAFT
+  READY
+  FAILED
+  ARCHIVED
+}
+
+enum WorldDeathMode {
+  NORMAL
+}
+
+enum CharacterStatus {
+  ACTIVE
+  DOWNED
+  ARCHIVED
+}
+
+enum CharacterStat {
+  PHYSICAL
+  MENTAL
+  SOCIAL
+}
+
+enum SessionStatus {
+  IDLE
+  PROCESSING_TURN
+  ERROR
+  FINISHED
+  ABANDONED
+}
+
+enum DangerLevel {
+  SAFE
+  RISKY
+  DANGER
+}
+
+enum InputType {
+  PRESET
+  FREE
+}
+
+enum TurnExecutionStatus {
+  RECEIVED
+  NORMALIZED
+  RULES_RESOLVED
+  NARRATIVE_GENERATED
+  VALIDATED
+  SAVED
+  FAILED
+}
+
+enum ActionCategory {
+  EXPLORATION
+  SOCIAL
+  PHYSICAL_RISK
+  ITEM_OR_SITUATION
+}
+
+enum ResolutionMode {
+  AUTO_SUCCESS
+  CHECK
+  AUTO_FAIL
+}
+
+enum RollMode {
+  NONE
+  NORMAL
+  ADVANTAGE
+  DISADVANTAGE
+}
+
+enum OutcomeType {
+  SUCCESS
+  PARTIAL_SUCCESS
+  FAILURE
+}
+
+enum OutcomeSeverity {
+  NORMAL
+  CRITICAL_SUCCESS
+  CRITICAL_FAILURE
+}
+
+enum ConsequenceType {
+  NONE
+  TIME_LOSS
+  POSITION_LOSS
+  THREAT_UP
+  RESOURCE_SPENT
+  RESOURCE_DAMAGED
+  NPC_ATTITUDE_DOWN
+  PATH_BLOCKED
+  SCENE_DEFEAT
+  HP_DAMAGE
+}
+
+enum AiFeature {
+  INPUT_NORMALIZER
+  NARRATIVE_TURN
+  WORLD_GENERATION
+  CHARACTER_GENERATION
+  SUMMARY_GENERATION
+}
+
+enum AiRequestStatus {
+  SUCCESS
+  FAILED
+  FALLBACK
+}
+
+model User {
+  id              String            @id @default(uuid()) @db.Uuid
+  email           String            @unique
+  displayName     String?
+  plan            UserPlan          @default(FREE)
+  planSource      String?
+  isEmailVerified Boolean           @default(false)
+  isBlocked       Boolean           @default(false)
+  lastSeenAt      DateTime?         @db.Timestamptz(6)
+  createdAt       DateTime          @default(now()) @db.Timestamptz(6)
+  updatedAt       DateTime          @updatedAt @db.Timestamptz(6)
+
+  subscriptions   UserSubscription[]
+  usagePeriods    UserUsagePeriod[]
+  worlds          World[]
+  characters      Character[]
+  sessions        AdventureSession[]
+  turnExecutions  TurnExecution[]
+  aiRequests      AiRequestLog[]
+}
+
+model UserSubscription {
+  id                     String             @id @default(uuid()) @db.Uuid
+  userId                 String             @db.Uuid
+  provider               BillingProvider
+  providerCustomerId     String?            @unique
+  providerSubscriptionId String?            @unique
+  status                 SubscriptionStatus
+  planCode               String
+  currentPeriodStart     DateTime?          @db.Timestamptz(6)
+  currentPeriodEnd       DateTime?          @db.Timestamptz(6)
+  cancelAtPeriodEnd      Boolean            @default(false)
+  canceledAt             DateTime?          @db.Timestamptz(6)
+  endedAt                DateTime?          @db.Timestamptz(6)
+  createdAt              DateTime           @default(now()) @db.Timestamptz(6)
+  updatedAt              DateTime           @updatedAt @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([userId, status])
+}
+
+model BillingEvent {
+  id              String          @id @default(uuid()) @db.Uuid
+  provider        BillingProvider
+  providerEventId String          @unique
+  eventType       String
+  payload         Json
+  status          String
+  processedAt     DateTime?       @db.Timestamptz(6)
+  errorCode       String?
+  createdAt       DateTime        @default(now()) @db.Timestamptz(6)
+}
+
+model UserUsagePeriod {
+  id                   String    @id @default(uuid()) @db.Uuid
+  userId               String    @db.Uuid
+  periodStart          DateTime  @db.Timestamptz(6)
+  periodEnd            DateTime  @db.Timestamptz(6)
+  effectivePlan        UserPlan
+  turnCount            Int       @default(0)
+  worldCreationCount   Int       @default(0)
+  characterCreationCount Int     @default(0)
+  normalizerCostUsd    Decimal   @default(0) @db.Decimal(12, 4)
+  narrativeCostUsd     Decimal   @default(0) @db.Decimal(12, 4)
+  otherAiCostUsd       Decimal   @default(0) @db.Decimal(12, 4)
+  createdAt            DateTime  @default(now()) @db.Timestamptz(6)
+  updatedAt            DateTime  @updatedAt @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@unique([userId, periodStart])
+  @@index([userId, periodEnd])
+}
+
+model WorldTemplate {
+  id          String   @id @default(uuid()) @db.Uuid
+  slug        String   @unique
+  title       String
+  genre       String?
+  tone        String?
+  description String?
+  templateData Json
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt   DateTime @updatedAt @db.Timestamptz(6)
+
+  worlds World[]
+}
+
+model World {
+  id                     String         @id @default(uuid()) @db.Uuid
+  ownerUserId            String         @db.Uuid
+  templateId             String?        @db.Uuid
+  status                 WorldStatus    @default(DRAFT)
+  visibility             WorldVisibility @default(PRIVATE)
+  deathMode              WorldDeathMode @default(NORMAL)
+  title                  String
+  genre                  String?
+  tone                   String?
+  userInput              String?
+  shortDescription       String?
+  worldData              Json
+  generationModel        String?
+  generationStatusReason String?
+  createdAt              DateTime       @default(now()) @db.Timestamptz(6)
+  updatedAt              DateTime       @updatedAt @db.Timestamptz(6)
+
+  owner      User            @relation(fields: [ownerUserId], references: [id])
+  template   WorldTemplate?  @relation(fields: [templateId], references: [id])
+  characters Character[]
+  sessions   AdventureSession[]
+  aiRequests AiRequestLog[]
+
+  @@index([ownerUserId])
+  @@index([templateId])
+  @@index([status])
+  @@index([visibility])
+}
+
+model Character {
+  id             String          @id @default(uuid()) @db.Uuid
+  ownerUserId    String          @db.Uuid
+  worldId        String          @db.Uuid
+  status         CharacterStatus @default(ACTIVE)
+  name           String
+  archetypeLabel String?
+  backstory      String?
+  motivation     String?
+  physicalStat   Int
+  mentalStat     Int
+  socialStat     Int
+  hpCurrent      Int
+  hpMax          Int
+  inventory      Json
+  createdAt      DateTime        @default(now()) @db.Timestamptz(6)
+  updatedAt      DateTime        @updatedAt @db.Timestamptz(6)
+
+  owner          User               @relation(fields: [ownerUserId], references: [id])
+  world          World              @relation(fields: [worldId], references: [id])
+  sessions       AdventureSession[]
+  turnExecutions TurnExecution[]
+  gameEvents     GameEvent[]
+  aiRequests     AiRequestLog[]
+
+  @@index([ownerUserId])
+  @@index([worldId])
+  @@index([status])
+}
+
+model AdventureSession {
+  id                 String             @id @default(uuid()) @db.Uuid
+  ownerUserId        String             @db.Uuid
+  worldId            String             @db.Uuid
+  characterId        String             @db.Uuid
+  status             SessionStatus      @default(IDLE)
+  currentTurnId      String?            @unique @db.Uuid
+  processingStartedAt DateTime?         @db.Timestamptz(6)
+  lastErrorCode      String?
+  turnCount          Int                @default(0)
+  dangerLevel        DangerLevel        @default(SAFE)
+  sceneGoal          String?
+  resultText         String?
+  sceneText          String?
+  availableChoices   Json
+  summaryState       Json
+  startedAt          DateTime           @default(now()) @db.Timestamptz(6)
+  lastActivityAt     DateTime           @default(now()) @db.Timestamptz(6)
+  endedAt            DateTime?          @db.Timestamptz(6)
+  createdAt          DateTime           @default(now()) @db.Timestamptz(6)
+  updatedAt          DateTime           @updatedAt @db.Timestamptz(6)
+
+  owner         User            @relation(fields: [ownerUserId], references: [id])
+  world         World           @relation(fields: [worldId], references: [id])
+  character     Character       @relation(fields: [characterId], references: [id])
+  currentTurn   TurnExecution?  @relation("CurrentSessionTurn", fields: [currentTurnId], references: [id])
+  turnExecutions TurnExecution[] @relation("SessionTurnExecutions")
+  gameEvents    GameEvent[]
+  aiRequests    AiRequestLog[]
+
+  @@index([ownerUserId])
+  @@index([worldId])
+  @@index([characterId])
+  @@index([status])
+  @@index([status, processingStartedAt])
+}
+
+model TurnExecution {
+  id                  String              @id @default(uuid()) @db.Uuid
+  sessionId           String              @db.Uuid
+  userId              String              @db.Uuid
+  characterId         String              @db.Uuid
+  status              TurnExecutionStatus @default(RECEIVED)
+  idempotencyKey      String?
+  inputType           InputType
+  selectedOptionId    String?
+  rawActionText       String?
+  normalizedIntent    String?
+  normalizerModel     String?
+  narrativeModel      String?
+  normalizerLatencyMs Int?
+  narrativeLatencyMs  Int?
+  totalLatencyMs      Int?
+  normalizerCostUsd   Decimal?            @db.Decimal(12, 4)
+  narrativeCostUsd    Decimal?            @db.Decimal(12, 4)
+  fallbackUsed        Boolean             @default(false)
+  errorCode           String?
+  errorMessage        String?
+  gameEventId         String?             @unique @db.Uuid
+  startedAt           DateTime            @default(now()) @db.Timestamptz(6)
+  finishedAt          DateTime?           @db.Timestamptz(6)
+  createdAt           DateTime            @default(now()) @db.Timestamptz(6)
+
+  session             AdventureSession    @relation("SessionTurnExecutions", fields: [sessionId], references: [id])
+  currentForSession   AdventureSession?   @relation("CurrentSessionTurn")
+  user                User                @relation(fields: [userId], references: [id])
+  character           Character           @relation(fields: [characterId], references: [id])
+  gameEvent           GameEvent?          @relation("TurnExecutionGameEvent", fields: [gameEventId], references: [id])
+  aiRequests          AiRequestLog[]
+
+  @@unique([sessionId, idempotencyKey])
+  @@index([sessionId])
+  @@index([status])
+  @@index([userId])
+  @@index([characterId])
+  @@index([startedAt])
+}
+
+model GameEvent {
+  id                  String            @id @default(uuid()) @db.Uuid
+  sessionId           String            @db.Uuid
+  characterId         String            @db.Uuid
+  sequenceNumber      Int
+  inputType           InputType
+  selectedOptionId    String?
+  rawActionText       String?
+  normalizedIntent    String?
+  actionCategory      ActionCategory?
+  primaryStat         CharacterStat?
+  resolutionMode      ResolutionMode?
+  difficultyDc        Int?
+  statValue           Int?
+  statModifier        Int?
+  situationalModifier Int?
+  rollMode            RollMode?
+  rolls               Json?
+  totalResult         Int?
+  outcome             OutcomeType?
+  outcomeSeverity     OutcomeSeverity?
+  consequenceType     ConsequenceType?
+  hpBefore            Int?
+  hpAfter             Int?
+  systemResolution    Json
+  resultText          String
+  sceneText           String
+  sceneGoal           String?
+  choices             Json
+  eventSummary        String
+  createdAt           DateTime          @default(now()) @db.Timestamptz(6)
+
+  session       AdventureSession @relation(fields: [sessionId], references: [id])
+  character     Character        @relation(fields: [characterId], references: [id])
+  turnExecution TurnExecution?   @relation("TurnExecutionGameEvent")
+
+  @@unique([sessionId, sequenceNumber])
+  @@index([sessionId, sequenceNumber])
+  @@index([characterId])
+  @@index([outcome])
+}
+
+model AiRequestLog {
+  id               String          @id @default(uuid()) @db.Uuid
+  feature          AiFeature
+  status           AiRequestStatus
+  provider         String
+  model            String
+  userId           String?         @db.Uuid
+  sessionId        String?         @db.Uuid
+  characterId      String?         @db.Uuid
+  worldId          String?         @db.Uuid
+  turnExecutionId  String?         @db.Uuid
+  promptTokens     Int?
+  completionTokens Int?
+  latencyMs        Int?
+  costUsd          Decimal?        @db.Decimal(12, 4)
+  errorCode        String?
+  createdAt        DateTime        @default(now()) @db.Timestamptz(6)
+
+  user          User?            @relation(fields: [userId], references: [id])
+  session       AdventureSession? @relation(fields: [sessionId], references: [id])
+  character     Character?       @relation(fields: [characterId], references: [id])
+  world         World?           @relation(fields: [worldId], references: [id])
+  turnExecution TurnExecution?   @relation(fields: [turnExecutionId], references: [id])
+
+  @@index([feature, createdAt])
+  @@index([model, createdAt])
+  @@index([userId])
+  @@index([sessionId])
+  @@index([turnExecutionId])
+}
